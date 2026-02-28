@@ -214,3 +214,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# testfile we use in order to test out different fucntions before i shove it into the code
+testFileDontPush.py

@@ -14,7 +14,7 @@ class TabCammy:
     def __init__(self, ui):
         self.ui = ui
 
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(1)
 
         self.maxFPS = cap.get(cv2.CAP_PROP_FPS)
         self.maxW = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -44,7 +44,7 @@ class TabCammy:
         self.ui.checkBoxMirror_xaxis.stateChanged.connect(self._update_mirror_x)
         self.ui.checkBoxMirror_yaxis.stateChanged.connect(self._update_mirror_y)
 
-        self.model = YOLO("src/model.pt") # initialize model. u should understand this i believe so
+        self.model = YOLO("model.pt") # initialize model. u should understand this i believe so
         self.detection_interval = 1 # My laptop lags when each and every frame updates. Every nth frame will be processed by the CNN model update where n will be the value of this
         self.frame_count = 0        # counts frames.
         self.last_cx = None         # saves previous center position - x
@@ -54,12 +54,13 @@ class TabCammy:
         self.virtual_cam_enabled = True # Variable to enable virtual cam or disable it.
 
     def _start_camera(self):
-        self.cap = cv2.VideoCapture(0)
+        self.cap = cv2.VideoCapture(1)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.resolution[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
         self.timer.start(int(1000 / self.fps))
 
-        # Pretty self explanatory. Also there is a bug that the virtual cam is resized to 4:3 ratio. I can't seem to find the problem so do check it out ;)
+        # Pretty self explanatory. Also there is a bug that the virtual cam is resized to 4:3 ratio. I can't seem to find the problem so do check it out ;) 
+        # Rudy here - idk man its happily doing doing 4k but we'll see
         if self.virtual_cam_enabled:
             self.virtual_cam = pyvirtualcam.Camera(
                 width=self.resolution[0], 
@@ -137,7 +138,7 @@ class TabCammy:
             self.virtual_cam.send(frame_resized)
         
         h, w, ch = frame.shape
-        qimg = QtGui.QImage(frame.data, w, h, w * ch, QtGui.QImage.Format.Format_RGB888).copy() # I honestly don't understand what the fuck is going on here. I copied this off stackoverflow
+        qimg = QtGui.QImage(frame.data, w, h, w * ch, QtGui.QImage.Format.Format_RGB888).copy() # I honestly don't understand what the bad-word is going on here. I copied this off stackoverflow
         self.ui.labelVideoPreview.setPixmap(
             QtGui.QPixmap.fromImage(qimg).scaled(
                 self.ui.labelVideoPreview.size(),
@@ -255,3 +256,4 @@ class TabCammy:
         self.ui.checkBoxKeepAwake.setChecked(bool(data.get("keep_device_awake", False)))
 
         self.ui.textEditStatus.append("Settings loaded")
+

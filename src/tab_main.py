@@ -187,3 +187,4 @@ class TabMain(QtCore.QObject):
         self.stop_scrcpy()
         self.start_scrcpy()
         self.list_adb_devices()
+
