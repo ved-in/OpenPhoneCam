@@ -836,7 +836,7 @@ QPushButton:disabled {
          </rect>
         </property>
         <property name="text">
-         <string>Version = whatever the fuck it is, code's gonna control this text anyways...</string>
+         <string>Version = VERUInternal-0.1.5</string>
         </property>
        </widget>
        <widget class="QLabel" name="scrcpyVersion">
@@ -880,7 +880,7 @@ QPushButton:disabled {
          </font>
         </property>
         <property name="text">
-         <string>Kanav if you're reading this, you a bitch.</string>
+         <string>work in progress!!.</string>
         </property>
        </widget>
        <widget class="QPushButton" name="enableEgg">
