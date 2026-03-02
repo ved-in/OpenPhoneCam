@@ -1,21 +1,58 @@
-import json
 import cv2
 import numpy as np
 from PyQt6 import QtGui, QtCore
-from PyQt6.QtWidgets import QFileDialog
 from PyQt6.QtCore import QThread, pyqtSignal
 from ultralytics import YOLO
 import pyvirtualcam
 import threading
 import time
 import subprocess
-import re
+import os
 
-device_index = 2 # edit this please vedant, right here
+device_index = 0
 
-# ==============================
-# YOLO WORKER THREAD
-# ==============================
+CONFIG = {
+    "inference_size": (416, 234),
+    "face_y_bias": 0.35,
+    "history_size": 5,
+    "max_misses": 5,
+    "max_jump_fraction": 0.12,
+    "pan_activation_radius": 5,
+    "pan_alpha": 0.06,
+    "target_face_fraction": 0.2,
+    "zoom_alpha": 0.04,
+    "crop_min_fraction": 0.1,
+    "crop_max_fraction": 0.95,
+    "loopback_video_nr": 10,
+    "loopback_card_label": "OpenPhoneCam",
+}
+
+
+def ensure_v4l2loopback():
+    device_path = f"/dev/video{CONFIG['loopback_video_nr']}"
+
+    if os.path.exists(device_path):
+        print(f"Using existing loopback device: {device_path}")
+        return True
+
+    print("Creating v4l2loopback device...")
+    result = subprocess.run(
+        [
+            "sudo", "modprobe", "v4l2loopback",
+            "devices=1",
+            f"video_nr={CONFIG['loopback_video_nr']}",
+            f"card_label={CONFIG['loopback_card_label']}",
+            "exclusive_caps=1",
+        ]
+    )
+
+    if result.returncode != 0:
+        print("modprobe failed.")
+        return False
+
+    time.sleep(0.5)
+    return os.path.exists(device_path)
+
 
 class YoloWorker(QThread):
     detection_ready = pyqtSignal(object)
@@ -58,12 +95,13 @@ class YoloWorker(QThread):
                 x1, y1, x2, y2 = box[:4]
 
                 cx = (x1 + x2) / 2
-                cy = y1 + (y2 - y1) * 0.35
+                cy = y1 + (y2 - y1) * CONFIG["face_y_bias"]
 
                 cx *= scale_x
                 cy *= scale_y
-
-                self.detection_ready.emit((int(cx), int(cy)))
+                face_w = (x2 - x1) * scale_x
+                
+                self.detection_ready.emit((int(cx), int(cy), face_w))
 
             else:
                 self.detection_ready.emit(None)
@@ -73,7 +111,6 @@ class YoloWorker(QThread):
         self.quit()
         self.wait()
 
-# VIRTUAL CAM CLASS
 
 class VirtualCamWorker(QThread):
     def __init__(self, width, height, fps):
@@ -81,7 +118,6 @@ class VirtualCamWorker(QThread):
         self.width = width
         self.height = height
         self.fps = fps
-
         self.frame = None
         self.lock = threading.Lock()
         self.running = True
@@ -108,9 +144,9 @@ class VirtualCamWorker(QThread):
                 frame = self.frame
 
             if frame is not None:
-                if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                    frame = cv2.resize(frame, (self.width, self.height))
-
+                fh, fw = frame.shape[:2]
+                if fw != self.width or fh != self.height:
+                    frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
                 self.cam.send(frame)
 
             elapsed = time.perf_counter() - start
@@ -123,15 +159,14 @@ class VirtualCamWorker(QThread):
         self.running = False
         self.wait()
 
-# ==============================
-# MAIN CAMERA CLASS
-# ==============================
 
 class TabCammy:
     def __init__(self, ui):
+        self.frame_count = 0
+        self.fps_timer_start = time.perf_counter()
         self.ui = ui
 
-        cap = cv2.VideoCapture(2)
+        cap = cv2.VideoCapture(device_index)
         self.maxFPS = cap.get(cv2.CAP_PROP_FPS) or 30
         self.maxW = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.maxH = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -148,165 +183,129 @@ class TabCammy:
         self.ui.lineEditResolution.setText(f"{self.maxW}x{self.maxH}")
 
         self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self._update_frame)
+        self.timer.timeout.connect(self.update_frame)
 
-        self.ui.btnConnect.clicked.connect(self._start_camera)
-        self.ui.btnDisconnect.clicked.connect(self._stop_camera)
+        self.ui.btnConnect.clicked.connect(self.start_camera)
+        self.ui.btnDisconnect.clicked.connect(self.stop_camera)
 
-        self.ui.lineEditFPS.editingFinished.connect(self._update_fps)
-        self.ui.lineEditResolution.editingFinished.connect(self._update_resolution)
-        self.ui.comboBoxAspectRatio.currentIndexChanged.connect(self._update_aspect_ratio)
+        self.ui.lineEditFPS.editingFinished.connect(self.update_settings)
+        self.ui.lineEditResolution.editingFinished.connect(self.update_settings)
+        self.ui.comboBoxAspectRatio.currentIndexChanged.connect(self.update_settings)
 
-        self.ui.checkBoxMirror_xaxis.stateChanged.connect(self._update_mirror_x)
-        self.ui.checkBoxMirror_yaxis.stateChanged.connect(self._update_mirror_y)
+        self.ui.checkBoxMirror_xaxis.stateChanged.connect(self.update_mirror)
+        self.ui.checkBoxMirror_yaxis.stateChanged.connect(self.update_mirror)
 
-        # ===== YOLO =====
-        self.model = YOLO("model.pt")  # use .to("cuda") if available
-        self.inference_size = (416, 234)
+        self.model = YOLO("model.pt")
+        self.inference_size = CONFIG["inference_size"]
 
         self.target_cx = None
         self.target_cy = None
         self.current_cx = None
         self.current_cy = None
-        self.smoothing_alpha = 0.08
         self.history = []
-        self.history_size = 5
+        self.history_size = CONFIG["history_size"]
         self.miss_count = 0
-        self.max_misses = 5
+        self.max_misses = CONFIG["max_misses"]
 
-        # ===== Virtual Cam =====
+        self.target_crop_w = None
+        self.target_crop_h = None
+        self.current_crop_w = None
+        self.current_crop_h = None
+
         self.virtual_cam = None
         self.virtual_cam_enabled = True
-
-        # ====== Attributes for class ======
 
         self.yolo_worker = None
         self.virtual_cam_worker = None
 
-        # ===== Output resolution =====
+        self.last_out_w = None
+        self.last_out_h = None
+
         self.output_width = 1920
         self.output_height = 1080
         self.preview_width = 960
         self.preview_height = 540
 
 
-    def _get_max_resolution(self, device_index):
-        device_path = f"/dev/video{device_index}"
-
-        try:
-            result = subprocess.run(
-                ["v4l2-ctl", "-d", device_path, "--list-formats-ext"],
-                capture_output=True,
-                text=True
-            )
-
-            output = result.stdout
-
-            resolutions = re.findall(r"Size: Discrete (\d+)x(\d+)", output)
-
-            if not resolutions:
-                return None
-
-            # Convert to integers
-            resolutions = [(int(w), int(h)) for w, h in resolutions]
-
-            # Pick highest pixel count
-            max_res = max(resolutions, key=lambda x: x[0] * x[1])
-
-            return max_res
-
-        except Exception as e:
-            print("Resolution detection failed:", e)
-            return None
-
-    # ==============================
-    # CAMERA CONTROL
-    # ==============================
-
-    def _start_camera(self):
+    def start_camera(self):
 
         self.cap = cv2.VideoCapture(device_index)
 
-        # Optional: unlock higher resolutions (important for many webcams)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
-        # Acquire highest resolution
-        max_res = self._get_max_resolution(device_index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 9999)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 9999)
 
-        if max_res : 
-            print("Maximum resolution is ", max_res)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, max_res[0])
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, max_res[1])
-        else : 
-            print("Couldnt detect max resolution, defaulting...")
+        max_res = (
+            int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        )
 
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
 
-        # Get ACTUAL resolution camera accepted
         actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         print("Camera running at:", actual_width, "x", actual_height)
 
-        # Match output to input
         self.output_width = actual_width
         self.output_height = actual_height
-
-        # Preview smaller
         self.preview_width = actual_width // 2
         self.preview_height = actual_height // 2
 
-        # Start YOLO
+        self.resolution = [actual_width, actual_height]
+
         self.yolo_worker = YoloWorker(self.model, self.inference_size)
-        self.yolo_worker.detection_ready.connect(self._update_center)
+        self.yolo_worker.detection_ready.connect(self.update_center)
         self.yolo_worker.start()
 
-        # Start virtual cam with REAL resolution
         if self.virtual_cam_enabled:
-            self.virtual_cam_worker = VirtualCamWorker(
-                self.output_width,
-                self.output_height,
-                int(self.fps)
-            )
-            self.virtual_cam_worker.start()
+            if not ensure_v4l2loopback():
+                print("Virtual camera disabled: no v4l2loopback device available.")
+                self.virtual_cam_enabled = False
+            else:
+                out_w, out_h = self.compute_output_dims()
+                self.virtual_cam_worker = VirtualCamWorker(out_w, out_h, int(self.fps))
+                self.virtual_cam_worker.start()
+                self.last_out_w = out_w
+                self.last_out_h = out_h
 
         self.timer.start(int(1000 / self.fps))
 
         self.ui.btnConnect.setEnabled(False)
         self.ui.btnDisconnect.setEnabled(True)
 
-    def _stop_camera(self):
+    def stop_camera(self):
         self.timer.stop()
 
         if self.cap:
             self.cap.release()
             self.cap = None
 
-        if hasattr(self, "virtual_cam_worker") and self.virtual_cam_worker is not None: # double trouble again, this double check is for safety ion wanna nuke my stuff dawg
+        if self.virtual_cam_worker is not None:
             self.virtual_cam_worker.stop()
             self.virtual_cam_worker = None
 
-        if hasattr(self, "yolo_worker") and self.yolo_worker is not None: # double trouble - checks if yolo worker attribute even exists otherwise attributeerror would nuke the program :P
+        if self.yolo_worker is not None:
             self.yolo_worker.stop()
             self.yolo_worker = None
-        
-        #resets coordinates, just to prevent some jarring snapping in the beginning
+
         self.target_cx = None
         self.target_cy = None
         self.current_cx = None
         self.current_cy = None
         self.history.clear()
+        self.target_crop_w = None
+        self.target_crop_h = None
+        self.current_crop_w = None
+        self.current_crop_h = None
+        self.last_out_w = None
+        self.last_out_h = None
 
         self.ui.btnConnect.setEnabled(True)
         self.ui.btnDisconnect.setEnabled(False)
 
-    # ==============================
-    # CENTER UPDATE FROM THREAD
-    # ==============================
-
-    def _update_center(self, center):
-
-        # --------- HANDLE MISSED DETECTIONS ----------
+    def update_center(self, center):
         if center is None:
             self.miss_count += 1
 
@@ -316,50 +315,67 @@ class TabCammy:
                 self.current_cx = None
                 self.current_cy = None
                 self.history.clear()
+                self.target_crop_w = None
+                self.target_crop_h = None
 
             return
 
-        # --------- VALID DETECTION ----------
         self.miss_count = 0
+        cx, cy, face_w = center
+        raw_crop_w = face_w / CONFIG["target_face_fraction"]
 
-        cx, cy = center
+        if self.aspectRatio and self.aspectRatio != "Auto":
+            target_ratio = self.get_target_ratio()
+        else:
+            frame_h = self.resolution[1]
+            frame_w = self.resolution[0]
+            target_ratio = frame_w / frame_h if frame_h > 0 else 16 / 9
 
-        # First detection
+        raw_crop_h = raw_crop_w / target_ratio
+
+        frame_w = self.resolution[0]
+        frame_h = self.resolution[1]
+        max_crop_w = frame_w * CONFIG["crop_max_fraction"]
+        min_crop_w = frame_w * CONFIG["crop_min_fraction"]
+        raw_crop_w = max(min_crop_w, min(max_crop_w, raw_crop_w))
+        raw_crop_h = raw_crop_w / target_ratio
+
+        if raw_crop_h > frame_h:
+            raw_crop_h = frame_h
+            raw_crop_w = raw_crop_h * target_ratio
+
+        self.target_crop_w = raw_crop_w
+        self.target_crop_h = raw_crop_h
+
         if self.target_cx is None or self.target_cy is None:
             self.target_cx = cx
             self.target_cy = cy
             self.history = [(cx, cy)]
             return
 
-        # Jump rejection
         dx = cx - self.target_cx
         dy = cy - self.target_cy
 
         frame_w = self.resolution[0]
         frame_h = self.resolution[1]
-        diag = (frame_w**2 + frame_h**2) ** 0.5
-        max_jump = diag * 0.12
-        distance = (dx**2 + dy**2) ** 0.5
+        diag = (frame_w**2 + frame_h**2)
+        max_jump = diag * CONFIG["max_jump_fraction"]
+        distance = (dx**2 + dy**2)
 
         if distance > max_jump:
-        # snap to new position
             self.target_cx = cx
             self.target_cy = cy
             self.history = [(cx, cy)]
             return
 
-        # History smoothing
         self.history.append((cx, cy))
         if len(self.history) > self.history_size:
             self.history.pop(0)
 
-        self.target_cx = round(self.target_cx, 2)
-        self.target_cy = round(self.target_cy, 2)
-    # ==============================
-    # FRAME LOOP (NOW NON-BLOCKING)
-    # ==============================
+        self.target_cx = round(sum(p[0] for p in self.history) / len(self.history), 2)
+        self.target_cy = round(sum(p[1] for p in self.history) / len(self.history), 2)
 
-    def _update_frame(self):
+    def update_frame(self):
         if not self.cap:
             return
 
@@ -369,57 +385,56 @@ class TabCammy:
 
         frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-        # Send frame to YOLO thread
-        self.yolo_worker.update_frame(frame)
+        if self.yolo_worker is not None:
+            self.yolo_worker.update_frame(frame)
 
-        # Smooth tracking and crop
-
-        # If we have no target yet, do nothing
         if self.target_cx is None or self.target_cy is None:
             pass
 
-        # If target exists but current not initialized → initialize
         elif self.current_cx is None or self.current_cy is None:
             self.current_cx = float(self.target_cx)
             self.current_cy = float(self.target_cy)
-
-        # If both exist → interpolate
         else:
             dx = self.target_cx - self.current_cx
             dy = self.target_cy - self.current_cy
-
             distance = (dx**2 + dy**2) ** 0.5
 
-            # Small activation threshold
-            activation_radius = 5   # <- try 6 to 10 range
+            if distance > CONFIG["pan_activation_radius"]:
+                self.current_cx = self.current_cx * (1 - CONFIG["pan_alpha"]) + self.target_cx * CONFIG["pan_alpha"]
+                self.current_cy = self.current_cy * (1 - CONFIG["pan_alpha"]) + self.target_cy * CONFIG["pan_alpha"]
 
-            if distance > activation_radius:
-                alpha = 0.06
-                self.current_cx = self.current_cx * (1 - alpha) + self.target_cx * alpha
-                self.current_cy = self.current_cy * (1 - alpha) + self.target_cy * alpha
+        fh, fw = frame.shape[:2]
 
-        # Crop only if current center exists
-        if self.current_cx is not None and self.current_cy is not None:
-            frame = self._center_crop(
-            frame,
-            self.current_cx,
-            self.current_cy
-        )
+        if self.target_crop_w is not None:
+            if self.current_crop_w is None:
+                self.current_crop_w = self.target_crop_w
+                self.current_crop_h = self.target_crop_h
+            else:
+                self.current_crop_w += (self.target_crop_w - self.current_crop_w) * CONFIG["zoom_alpha"]
+                self.current_crop_h += (self.target_crop_h - self.current_crop_h) * CONFIG["zoom_alpha"]
 
-        cropped = frame
+        if self.current_cx is not None and self.current_cy is not None and self.current_crop_w is not None:
+            frame = self.process_frame(frame, self.current_cx, self.current_cy, int(self.current_crop_w), int(self.current_crop_h))
+        else:
+            if self.aspectRatio and self.aspectRatio != "Auto":
+                target_ratio = self.get_target_ratio()
+                if (fw / fh) > target_ratio:
+                    crop_w = int(fh * target_ratio)
+                    crop_h = fh
+                else:
+                    crop_w = fw
+                    crop_h = int(fw / target_ratio)
+                frame = self.process_frame(frame, fw / 2, fh / 2, crop_w, crop_h)
 
-        # Downscale cropped 4K region to 1080p for output
+        out_w = self.last_out_w or self.output_width
+        out_h = self.last_out_h or self.output_height
+
         output_frame = cv2.resize(
-            cropped,
-            (self.output_width, self.output_height),
+            frame,
+            (out_w, out_h),
             interpolation=cv2.INTER_AREA
         )
 
-        # Aspect ratio
-        if self.aspectRatio and self.aspectRatio != "Auto":
-            frame = self._change_image_ratio(frame)
-
-        # Mirror
         flip_code = None
         if self.mirror_xaxis and self.mirror_yaxis:
             flip_code = -1
@@ -429,91 +444,95 @@ class TabCammy:
             flip_code = 1
 
         if flip_code is not None:
-            frame = cv2.flip(frame, flip_code)
+            output_frame = cv2.flip(output_frame, flip_code)
 
-        frame = np.ascontiguousarray(frame)
+        output_frame = np.ascontiguousarray(output_frame)
 
-        # Virtual cam
-        if hasattr(self, "virtual_cam_worker"):
+        if self.virtual_cam_worker is not None:
             self.virtual_cam_worker.update_frame(output_frame)
 
-        # Preview and resize because you dont need to see the full output just for a preview, this is for optimization
         preview_frame = cv2.resize(
             output_frame,
-            (self.preview_width, self.preview_height),
-             interpolation=cv2.INTER_AREA
-            )
+            (out_w // 2, out_h // 2),
+            interpolation=cv2.INTER_AREA
+        )
 
         h, w, ch = preview_frame.shape
         qimg = QtGui.QImage(
             preview_frame.data,
-            w,
-            h,
+            w, h,
             w * ch,
             QtGui.QImage.Format.Format_RGB888
         )
 
-        self.ui.labelVideoPreview.setPixmap(
-            QtGui.QPixmap.fromImage(qimg)
-        )
+        self.ui.labelVideoPreview.setPixmap(QtGui.QPixmap.fromImage(qimg))
 
-    # ==============================
-    # CROPPING
-    # ==============================
-
-    def _center_crop(self, frame, cx, cy):
+    def process_frame(self, frame, cx, cy, crop_w, crop_h):
         h, w = frame.shape[:2]
-        crop_scale = 0.5
-        crop_w = int(w * crop_scale)
-        crop_h = int(h * crop_scale)
+        crop_w = max(1, min(crop_w, w))
+        crop_h = max(1, min(crop_h, h))
 
-        x1 = cx - crop_w / 2
-        y1 = cy - crop_h / 2
-
-        x1 = max(0, min(x1, w - crop_w))
-        y1 = max(0, min(y1, h - crop_h))
-
-        x1 = int(round(x1))
-        y1 = int(round(y1))
+        x1 = int(round(max(0, min(cx - crop_w / 2, w - crop_w))))
+        y1 = int(round(max(0, min(cy - crop_h / 2, h - crop_h))))
 
         return frame[y1:y1 + crop_h, x1:x1 + crop_w]
 
-    def _change_image_ratio(self, frame):
-        h, w = frame.shape[:2]
-        parts = self.aspectRatio.split(":")
-        target_ratio = float(parts[0]) / float(parts[1])
-        current_ratio = w / h
-
-        if current_ratio > target_ratio:
-            new_w = int(h * target_ratio)
-            offset = (w - new_w) // 2
-            return frame[:, offset:offset + new_w]
+    def compute_output_dims(self):
+        if not self.aspectRatio or self.aspectRatio == "Auto":
+            return self.output_width, self.output_height
+        target_ratio = self.get_target_ratio()
+        if (self.output_width / self.output_height) > target_ratio:
+            out_w = int(self.output_height * target_ratio)
+            out_h = self.output_height
         else:
-            new_h = int(w / target_ratio)
-            offset = (h - new_h) // 2
-            return frame[offset:offset + new_h, :]
+            out_w = self.output_width
+            out_h = int(self.output_width / target_ratio)
+        out_w -= out_w % 2
+        out_h -= out_h % 2
+        return out_w, out_h
 
-    # ==============================
-    # SETTINGS
-    # ==============================
+    def restart_virtual_cam(self, width, height):
+        if not self.virtual_cam_enabled:
+            return
 
-    def _update_fps(self):
+        if self.virtual_cam_worker is not None:
+            self.virtual_cam_worker.stop()
+            self.virtual_cam_worker = None
+
+        subprocess.run(["sudo", "rmmod", "v4l2loopback"],
+                       capture_output=True)
+
+        if not ensure_v4l2loopback():
+            print("Virtual camera restart failed.")
+            self.virtual_cam_enabled = False
+            return
+
+        self.virtual_cam_worker = VirtualCamWorker(width, height, int(self.fps))
+        self.virtual_cam_worker.start()
+        self.last_out_w = width
+        self.last_out_h = height
+        print(f"Virtual cam restarted at {width}x{height}")
+
+    def update_settings(self):
         try:
             self.fps = int(self.ui.lineEditFPS.text())
         except ValueError:
-            return
-
-    def _update_resolution(self):
+            pass
         try:
             self.resolution = [int(x) for x in self.ui.lineEditResolution.text().split("x")]
         except ValueError:
-            return
-
-    def _update_aspect_ratio(self):
+            pass
         self.aspectRatio = self.ui.comboBoxAspectRatio.currentText()
 
-    def _update_mirror_x(self):
-        self.mirror_xaxis = self.ui.checkBoxMirror_xaxis.isChecked()
+        if self.cap is not None:
+            out_w, out_h = self.compute_output_dims()
+            if out_w != self.last_out_w or out_h != self.last_out_h:
+                self.restart_virtual_cam(out_w, out_h)
 
-    def _update_mirror_y(self):
-        self.mirror_yaxis = self.ui.checkBoxMirror_yaxis.isChecked()# Small preview frame (never send 4K to Qt)
+    def update_mirror(self):
+        self.mirror_xaxis = self.ui.checkBoxMirror_xaxis.isChecked()
+        self.mirror_yaxis = self.ui.checkBoxMirror_yaxis.isChecked()
+
+    def get_target_ratio(self):
+        parts = self.aspectRatio.split(":")
+        return float(parts[0]) / float(parts[1])
